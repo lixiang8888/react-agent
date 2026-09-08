@@ -1,0 +1,13 @@
+# 密钥 / 本地配置 —— 绝不提交
+keys.py
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 依赖目录（如未来本地建 RAG 索引用）
+.venv/
+venv/
