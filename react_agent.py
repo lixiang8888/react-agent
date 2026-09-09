@@ -31,7 +31,6 @@ README 里的逻辑模块在此文件中的落点：
 """
 
 import ast
-import json
 import os
 import re
 import sys
@@ -140,11 +139,15 @@ TOOL_REGISTRY: dict[str, Tool] = {"search": SearchTool()}
 # 以后加工具：TOOL_REGISTRY["weather"] = WeatherTool()
 
 
-def execute_tool(name: str, arg: str) -> str:
-    """执行工具（若名字非法返回错误 Observation，让模型自己纠正）。"""
-    tool = TOOL_REGISTRY.get(name)
+def execute_tool(name: str, arg: str, registry: dict | None = None) -> str:
+    """执行工具（若名字非法返回错误 Observation，让模型自己纠正）。
+
+    registry 缺省为全局 TOOL_REGISTRY；传入桩工具注册表即可离线测试。
+    """
+    registry = TOOL_REGISTRY if registry is None else registry
+    tool = registry.get(name)
     if tool is None:
-        available = ", ".join(t.usage_hint for t in TOOL_REGISTRY.values())
+        available = ", ".join(t.usage_hint for t in registry.values())
         return f"错误：未知工具 {name!r}。可用工具格式：{available}"
     try:
         return tool.run(arg)
@@ -234,14 +237,30 @@ def parse_output(text: str) -> dict:
             return {"kind": "malformed", "thought": thought, "payload": text}
         return {"kind": "action", "thought": thought, "payload": payload}
 
-    # final：回答正文在下一个回合标记（Thought/Action/新 Final）处截断
+    # final：回答正文默认读到结尾，但若之后还有"真·新回合"的协议标记则截断。
+    # 启发式（正文里举例式的 Action:/Observation: 不该被误当回合头）：
+    #   尾部 ≥2 个标记  → 判为链式回合，在第一个处截断；
+    #   尾部只有 1 个 Action 标记 → 仅当该行形如 search(...) 调用才截断；
+    #   尾部只有 1 个 Thought/Final Answer/Observation 标记 → 截断；
+    #   尾部无标记 → 整段作为答案保留。
     tail = text[m.end():]
-    next_round = re.search(r"(?m)^\s*(?:Thought|Action|Final Answer|Observation)\s*[:：]",
-                           tail)
-    if next_round:
-        payload = tail[:next_round.start()].strip()
-    else:
-        payload = tail.strip()
+    tail_markers = list(re.finditer(
+        r"(?m)^\s*(?:Thought|Action|Final Answer|Observation)\s*[:：]", tail))
+    cut = None
+    if len(tail_markers) >= 2:
+        cut = tail_markers[0].start()
+    elif len(tail_markers) == 1:
+        line = tail[tail_markers[0].start():].splitlines()[0].lstrip() \
+            if tail[tail_markers[0].start():] else ""
+        if re.match(r"(?i)^(Thought|Final Answer|Observation)\b", line):
+            cut = tail_markers[0].start()
+        else:                                   # 剩下的单标记是 Action
+            rest = re.sub(r"(?i)^Action\s*[:：]\s*", "", line, count=1)
+            if re.match(r"^[A-Za-z_]\w*\s*[(（]", rest):
+                cut = tail_markers[0].start()
+    payload = tail[:cut].strip() if cut is not None else tail.strip()
+    if not payload:
+        return {"kind": "malformed", "thought": thought, "payload": text}
     return {"kind": "final", "thought": thought, "payload": payload}
 
 
@@ -249,20 +268,43 @@ def parse_output(text: str) -> dict:
 # 4. parse-action：把 `search("关键词")` 拆成 (工具名, 参数)
 # ---------------------------------------------------------------------------
 
-_ACTION_RE = re.compile(r"^([A-Za-z_]\w*)\s*\(([\s\S]*)\)\s*$")
-
-
 def parse_action(action_text: str) -> tuple[str | None, str]:
     """
     拆 `search("关键词")` → ("search", "关键词")。
-    参数是字符串字面量时用 ast.literal_eval 安全求值（兼容单引号/多行）。
-    拆不出来返回 (None, 原文)，由调用方转成“无法解析”的 Observation。
+
+    用"平衡括号扫描"解析：从工具名后第一个括号开始，跳过引号内的内容、
+    计数括号直到归零；**括号之后的解释性文字一律忽略**（模型常在 Action 后
+    追加一句说明）。全角括号（）先归一化成半角。参数是字符串字面量时用
+    ast.literal_eval 安全求值（兼容单引号/多行/转义）。
+    拆不出来返回 (None, 原文)，由调用方转成"无法解析"的 Observation。
     """
-    action_text = (action_text or "").strip()
-    m = _ACTION_RE.match(action_text)
+    text = (action_text or "").strip().replace("（", "(").replace("）", ")")
+    m = re.match(r"^([A-Za-z_]\w*)\s*\(", text)
     if not m:
         return None, action_text
-    name, raw = m.group(1), m.group(2).strip()
+    name = m.group(1)
+
+    # 逐字符扫描：跳过引号包裹的内容，括号配对归零即找到参数结尾
+    i = m.end()
+    depth = 1
+    quote: str | None = None
+    j = i
+    while j < len(text) and depth > 0:
+        ch = text[j]
+        if quote:
+            if ch == quote and text[j - 1] != "\\":   # 忽略 \" 这类转义引号
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        j += 1
+    if depth != 0:                  # 括号不平衡，无法可靠解析
+        return None, action_text
+
+    raw = text[i:j - 1].strip()
     arg = raw
     try:
         parsed = ast.literal_eval(raw)
@@ -280,7 +322,8 @@ def parse_action(action_text: str) -> tuple[str | None, str]:
 class ReActAgent:
     def __init__(self, llm=deepseek_chat, registry: dict | None = None,
                  max_steps: int = 6, verbose: bool = True):
-        if not DEEPSEEK_API_KEY:
+        # 只有真正会用默认 deepseek_chat 时才需要 key；注入桩 llm（自测）可无 key
+        if llm is deepseek_chat and not DEEPSEEK_API_KEY:
             raise RuntimeError(
                 "未配置 DeepSeek API key：请设置环境变量 DEEPSEEK_API_KEY，或在本目录放 keys.py")
         self.llm = llm
@@ -288,17 +331,6 @@ class ReActAgent:
         self.max_steps = max_steps
         self.verbose = verbose
         self.system_prompt = build_system_prompt(self.registry)
-
-    # ---- 执行工具（基于 self.registry，便于测试替换桩工具） ----
-    def _execute(self, name: str, arg: str) -> str:
-        tool = self.registry.get(name)
-        if tool is None:
-            available = ", ".join(t.usage_hint for t in self.registry.values())
-            return f"错误：未知工具 {name!r}。可用工具格式：{available}"
-        try:
-            return tool.run(arg)
-        except Exception as e:      # 网络/限流/欠费都兜住，转成 Observation
-            return f"工具 {name} 执行出错：{e}。请换措辞重试，或直接基于已有信息作答。"
 
     # ---- 日志（verbose 时边跑边打印，方便看循环） ----
     def _log_step(self, step: int, thought: str | None, action_disp: str,
@@ -319,7 +351,7 @@ class ReActAgent:
         - session_messages：多轮记忆前缀（见 Session），run 本身不保存记忆。
         - trace：每一步的 (thought, action, observation) 列表，供展示/测试。
         """
-        max_steps = max_steps or self.max_steps
+        max_steps = self.max_steps if max_steps is None else max_steps
         messages = [{"role": "system", "content": self.system_prompt}]
         if session_messages:
             messages += list(session_messages)
@@ -330,7 +362,14 @@ class ReActAgent:
 
         for step in range(1, max_steps + 1):
             # ② 调 LLM 思考
-            reply = (self.llm(messages) or "").strip()
+            try:
+                reply = (self.llm(messages) or "").strip()
+            except Exception as e:      # 网络/限流/欠费别让整个会话崩掉
+                err = f"[模型调用失败] {e}，可稍后重试。"
+                trace.append({"type": "error", "error": str(e)})
+                if self.verbose:
+                    print(f"\n[!] {err}")
+                return err, trace
             last_reply = reply
             if not reply:
                 if self.verbose:
@@ -362,7 +401,7 @@ class ReActAgent:
             if name is None:
                 obs = f'无法解析 Action：{payload!r}。格式应为 search("关键词")，且一次只做一个 Action。'
             else:
-                obs = self._execute(name, arg)   # 工具类执行（默认走 Tavily 搜索）
+                obs = execute_tool(name, arg, self.registry)   # 工具类执行（默认走 Tavily 搜索）
 
             action_disp = payload if name is None else f'{name}({arg!r})'
             trace.append({"type": "action", "step": step, "thought": thought,
@@ -402,7 +441,8 @@ class Session:
 
     def ask(self, question: str) -> tuple[str | None, list]:
         answer, trace = self.agent.run(question, session_messages=self.memory)
-        if answer:   # 只回写干净的 Q/A，不写轨迹
+        # 只回写"真正给出最终答案"的轮次：兜底文本 / 模型调用失败 / 空答案不入记忆
+        if answer and trace and trace[-1].get("type") == "final":
             self.memory.append({"role": "user", "content": question})
             self.memory.append({"role": "assistant", "content": answer})
             self._trim()
@@ -554,6 +594,41 @@ def _selftest() -> bool:
     session.max_rounds = 1
     session.ask("第三问")
     check("超过轮数上限会裁剪旧记忆", len(session.memory) == 2)
+
+    print("== parser 鲁棒性（尾随文字 / 全角括号 / 空答案） ==")
+    check("Action 同行尾随解释仍可拆",
+          parse_action('search("上海天气")（需要最新信息）') == ("search", "上海天气"))
+    check("Action 换行尾随解释仍可拆",
+          parse_action('search("上海天气")\n因为要查最新') == ("search", "上海天气"))
+    check("全角括号可拆", parse_action('search（"上海"）') == ("search", "上海"))
+    check("引号内含括号不计深度",
+          parse_action('search("吃(什么)比较好")') == ("search", "吃(什么)比较好"))
+    check("括号不平衡 → 拆不出",
+          parse_action('search("上海"') == (None, 'search("上海"'))
+    check("空 Final 视为 malformed",
+          parse_output("Thought: 好\nFinal Answer:")["kind"] == "malformed")
+
+    print("== Final 正文截断启发式 ==")
+    r = parse_output('Thought: ok\nFinal Answer: 多行正文\nAction: 这里只是举例格式')
+    check("正文中的举例式 Action 行不被截断",
+          r["kind"] == "final" and r["payload"].count("Action:") == 1)
+    r = parse_output("Thought: 一步\nFinal Answer: 总结\nThought: 补充\nAction: search(\"y\")")
+    check("正文后跟真·链式回合才截断",
+          r["kind"] == "final" and r["payload"] == "总结")
+
+    print("== 模型调用失败兜底 ==")
+    def boom_llm(messages):
+        raise RuntimeError("429 rate limit")
+    boom_agent = ReActAgent(llm=boom_llm, registry=registry, verbose=False)
+    boom_answer, boom_trace = boom_agent.run("问题")
+    check("LLM 异常不抛出、返回友好提示",
+          str(boom_answer).startswith("[模型调用失败]")
+          and any(t["type"] == "error" for t in boom_trace))
+
+    print("== Session 不存非最终结果 ==")
+    boom_session = Session(agent=boom_agent)
+    boom_answer2, _ = boom_session.ask("问题")
+    check("失败轮次不入记忆", len(boom_session.memory) == 0)
 
     print()
     return ok
