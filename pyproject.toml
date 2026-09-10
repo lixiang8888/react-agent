@@ -1,0 +1,9 @@
+[project]
+name = "react-agent"
+version = "0.1.0"
+description = "ReAct Agent 个人实践：DeepSeek 思考 + Tavily 搜索"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+]

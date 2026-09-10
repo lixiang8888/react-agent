@@ -5,10 +5,19 @@
 
 ### 快速开始
 
-依赖：**Python ≥ 3.10**（代码用了 `X | None`、`dict[str, Tool]` 这类注解）+ `requests`（唯一第三方依赖）。
+依赖：**Python ≥ 3.10**（代码用了 `X | None`、`dict[str, Tool]` 这类注解）+ `requests`（唯一第三方依赖）。依赖已声明在 [pyproject.toml](pyproject.toml)，[uv.lock](uv.lock) 锁定了版本。
+
+推荐用 [uv](https://docs.astral.sh/uv/)：
 
 ```bash
-pip install requests
+uv sync          # 建 .venv 并按 uv.lock 安装依赖
+```
+
+或者只用 pip：
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install requests
 ```
 
 **配置 key**（优先级：环境变量 > 本目录 `keys.py`）：
@@ -21,7 +30,7 @@ export TAVILY_API_KEY="tvly-..."
 
 > 安全：`keys.py` 已在 [.gitignore](.gitignore) 中忽略、不会进 git。若曾把真实 key 填进文件并外传过，请到 DeepSeek / Tavily 控制台轮换重置。
 
-**运行**（在 WSL 内）：
+**运行**（在 WSL 内；用 uv 时把 `python3` 换成 `uv run python`）：
 
 ```bash
 python3 react_agent.py "问题"             # 单次提问
@@ -115,5 +124,7 @@ Final Answer: 给用户的最终回答
 ### 相关文件
 
 * [react_agent.py](react_agent.py) —— 全部逻辑（工具、提示词、parser、主循环、记忆、CLI、自测）
+* [pyproject.toml](pyproject.toml) —— 项目元信息与依赖声明
+* [uv.lock](uv.lock) —— uv 锁定的依赖版本（勿手改）
 * [keys.py](keys.py) —— 本地密钥模板（已 gitignore，**勿提交**；推荐改用环境变量）
-* [.gitignore](.gitignore) —— 忽略 `keys.py`、`.env`、`__pycache__/` 等
+* [.gitignore](.gitignore) —— 忽略 `keys.py`、`.env`、`.venv/`、`__pycache__/` 等
